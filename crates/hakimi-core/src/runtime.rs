@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -213,6 +213,9 @@ pub struct HakimiRuntime {
     proxy_listen: Arc<RwLock<Option<SocketAddr>>>,
     proxy_error: Arc<RwLock<Option<String>>>,
     proxy_applied: Arc<RwLock<Option<bool>>>,
+    /// Consecutive read-backs that disagreed with what we installed. One
+    /// disagreement is a race with the OS proxy service, not a loss.
+    proxy_lost_streak: AtomicU32,
     handle: RwLock<Option<ProxyHandle>>,
     /// Raw relay listener, present only while `advanced.relay.enabled` is set.
     /// Kept separate from `handle` so the proxy stop path is untouched when the
@@ -362,6 +365,7 @@ impl HakimiRuntime {
             proxy_listen,
             proxy_error,
             proxy_applied,
+            proxy_lost_streak: AtomicU32::new(0),
             handle: RwLock::new(None),
             #[cfg(not(target_os = "android"))]
             relay: RwLock::new(None),
@@ -699,6 +703,13 @@ impl HakimiRuntime {
         self.proxy_applied.read().unwrap_or(true)
     }
 
+    /// Consecutive read-back disagreements that mean the takeover is gone.
+    ///
+    /// The environment probe reads the OS every few seconds, so three strikes
+    /// spans several seconds — long enough for our own write and the OS
+    /// notification to settle.
+    const TAKEOVER_LOST_STREAK: u32 = 3;
+
     /// Read the OS back to see whether the takeover we installed is still in
     /// place. `Some(true)` means it was changed or switched off by someone
     /// else; `None` means there is nothing to check or the OS could not be
@@ -706,24 +717,60 @@ impl HakimiRuntime {
     ///
     /// This queries the OS (macOS spawns `scutil --proxy`), so it belongs on
     /// the environment probe thread, not on the UI thread.
+    ///
+    /// A single disagreement is not evidence of a takeover by someone else:
+    /// the probe races both our own write and the OS proxy service's reload,
+    /// and acting on it made the UI abandon the takeover and immediately
+    /// re-apply it in a loop. Only a run of consecutive disagreements counts.
     pub fn takeover_lost(&self) -> Option<bool> {
         if *self.proxy_applied.read() != Some(true) {
+            self.proxy_lost_streak.store(0, Ordering::SeqCst);
             return None;
         }
-        match self.config.snapshot().proxy.mode {
-            ProxyMode::Pac => {
-                let url = self.pac_url()?;
-                self.system_proxy
-                    .still_ours(ProxyMode::Pac, &url)
-                    .map(|ours| !ours)
+        let mode = self.config.snapshot().proxy.mode;
+        let ours = || -> Option<bool> {
+            match mode {
+                ProxyMode::Pac => {
+                    let url = self.pac_url()?;
+                    self.system_proxy.still_ours(ProxyMode::Pac, &url)
+                }
+                ProxyMode::Http => {
+                    let listen = (*self.proxy_listen.read())?;
+                    self.system_proxy
+                        .still_ours(ProxyMode::Http, &listen.to_string())
+                }
+                ProxyMode::Off => None,
             }
-            ProxyMode::Http => {
-                let listen = (*self.proxy_listen.read())?;
-                self.system_proxy
-                    .still_ours(ProxyMode::Http, &listen.to_string())
-                    .map(|ours| !ours)
+        };
+        match ours() {
+            // Read back and still ours: any earlier disagreement was
+            // transient, so the next loss must start counting from scratch.
+            Some(true) => {
+                self.proxy_lost_streak.store(0, Ordering::SeqCst);
+                Some(false)
             }
-            ProxyMode::Off => None,
+            // Unreadable: unknown, never "lost", and do not let a gap in the
+            // read-back accumulate into a verdict.
+            None => {
+                self.proxy_lost_streak.store(0, Ordering::SeqCst);
+                None
+            }
+            Some(false) => {
+                let streak = self.proxy_lost_streak.fetch_add(1, Ordering::SeqCst) + 1;
+                if streak < Self::TAKEOVER_LOST_STREAK {
+                    tracing::debug!(
+                        streak,
+                        "system proxy read-back disagreed once; waiting for the next probe"
+                    );
+                    return None;
+                }
+                self.proxy_lost_streak.store(0, Ordering::SeqCst);
+                tracing::warn!(
+                    streak,
+                    "the system proxy has not pointed at this instance for several probes"
+                );
+                Some(true)
+            }
         }
     }
 

@@ -335,11 +335,13 @@ impl SystemProxyManager {
         })
     }
 
-    /// Read the value back once after writing. macOS propagates proxy changes
-    /// through configd, so a write can take a few hundred milliseconds to show
-    /// up in `scutil`; retry briefly instead of reporting a false failure.
+    /// Read the value back after writing. Neither platform makes the write
+    /// visible synchronously: macOS goes through configd, Windows through the
+    /// WinINet settings notification, and both can take a few hundred
+    /// milliseconds. Retry briefly instead of reporting a false failure —
+    /// callers treat "not applied" as "someone else took the proxy over".
     fn verify(&self, mode: ProxyMode, expected: String) -> Result<SystemProxyStatus> {
-        let attempts = if cfg!(target_os = "macos") { 5 } else { 1 };
+        let attempts = if cfg!(target_os = "macos") { 5 } else { 3 };
         let mut last = None;
         for attempt in 0..attempts {
             let status = self.status(Some(mode), Some(expected.clone()));
@@ -1408,6 +1410,46 @@ fn notify_proxy_changed() {
             refreshed,
             error = %std::io::Error::last_os_error(),
             "WinINet did not acknowledge the proxy change notification"
+        );
+    }
+    broadcast_settings_changed();
+}
+
+/// Tell every top-level window that the proxy settings changed.
+///
+/// `InternetSetOption(INTERNET_OPTION_SETTINGS_CHANGED)` only reloads the
+/// WinINet configuration of *this* process. A browser that is already running
+/// keeps the configuration it read at start-up until it sees
+/// `WM_SETTINGCHANGE`, which is why a takeover can look like "the proxy works
+/// for some connections but not for Edge": the browser was started before the
+/// write, so it is still on the old, direct configuration. The parameter is
+/// the registry path WinINet itself uses for this notification.
+#[cfg(windows)]
+fn broadcast_settings_changed() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+    };
+
+    let area: Vec<u16> = INTERNET_SETTINGS.encode_utf16().chain([0]).collect();
+    let mut ignored: usize = 0;
+    // A hung window must not hold the apply path: SMTO_ABORTIFHUNG plus a
+    // short timeout keeps this bounded. Zero means no window answered, which
+    // is normal on a session without a desktop.
+    let sent = unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            area.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            1_000,
+            &mut ignored,
+        )
+    };
+    if sent == 0 {
+        tracing::debug!(
+            error = %std::io::Error::last_os_error(),
+            "no window accepted the proxy settings broadcast"
         );
     }
 }
